@@ -1,0 +1,215 @@
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import keras
+from keras.models import Sequential, Input, Model
+from keras.layers import Dense, Dropout, Activation, BatchNormalization, concatenate
+from keras.optimizers import Adam, SGD
+from keras.models import load_model
+from keras.callbacks import ModelCheckpoint, EarlyStopping
+
+# Input data files are available in the "../input/" directory.
+# For example, running this (by clicking run or pressing Shift+Enter) will list the files in the input directory
+
+import os
+print(os.listdir("../input"))
+
+# Any results you write to the current directory are saved as output.
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import lightgbm as lgb
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
+
+plt.style.use('seaborn')
+sns.set(font_scale=1)
+
+random_state = 42
+np.random.seed(random_state)
+
+
+def augment(x, y, t=2):
+    xs,xn = [],[]
+    for i in range(t):
+        mask = y>0
+        x1 = x[mask].copy()
+        ids = np.arange(x1.shape[0])
+        for c in range(x1.shape[1]):
+            np.random.shuffle(ids)
+            x1[:,c] = x1[ids][:,c]
+        xs.append(x1)
+
+    for i in range(t//2):
+        mask = y==0
+        x1 = x[mask].copy()
+        ids = np.arange(x1.shape[0])
+        for c in range(x1.shape[1]):
+            np.random.shuffle(ids)
+            x1[:,c] = x1[ids][:,c]
+        xn.append(x1)
+
+    xs = np.vstack(xs)
+    xn = np.vstack(xn)
+    ys = np.ones(xs.shape[0])
+    yn = np.zeros(xn.shape[0])
+    x = np.vstack([x,xs,xn])
+    y = np.concatenate([y,ys,yn])
+    return x,y
+
+
+def train_nn(self, x_train, y_train, x_test, y_test):
+    """
+    训练神经网络模型并保存
+    :param x_train:
+    :param y_train:
+    :param x_test:
+    :return: 预测结果
+    """
+    y_train = y_train.astype(int)
+    y_train = y_train[:, np.newaxis]
+
+    input = Input(shape=[x_train.shape[1]], name="input")
+    d1 = Dropout(0.5)(input)
+    f1 = Dense(128, activation='elu')(d1)
+    d2 = Dropout(0.4)(f1)
+    f2 = Dense(64, activation='elu')(d2)
+    f3 = Dense(32, activation='elu')(f2)
+    d3 = Dropout(0.2)(f3)
+    c1 = concatenate([input, d2, d3])
+    output = Dense(1, activation='sigmoid')(c1)
+    model = Model([input], output)
+
+    # model.add(Dropout(0.5, input_shape=(x_train.shape[1],)))
+    # model.add(Dense(20, activation='elu'))
+    # model.add(Dropout(0.4))
+    # model.add(Dense(10, activation='elu'))
+    # model.add(Dense(5, activation='elu'))
+    #
+    # model.add(Dropout(0.2))
+    # model.add(Dense(1, activation='sigmoid'))
+    model.summary()
+    adam = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+    # sgd = SGD(lr=0.01, momentum=0.9, decay=0.0, nesterov=False)
+    model.compile(loss='binary_crossentropy',
+                  optimizer=adam,
+                  metrics=['accuracy', self.auc]
+                  )
+
+    early_stopping = EarlyStopping(monitor='val_auc', patience=3, verbose=1, mode='max')
+    model.fit(x_train, y_train, validation_data=(x_test, y_test),
+              callbacks=[early_stopping], epochs=20, batch_size=512, verbose=1)
+
+    # 存储
+    model.save(self.model_path)
+    # 读取
+    model_load = load_model(self.model_path, {'auc': self.auc})
+    test_predict_prob = model_load.predict(x_test, batch_size=512)
+    test_predict_prob_all = model_load.predict(x_test, batch_size=512)
+    # np_predict = np.ceil(test_predict_prob_all * 100) - 1
+    # self.all_np(np_predict)
+    return test_predict_prob
+
+
+def train():
+    df_train = pd.read_csv('../input/train.csv')
+    df_test = pd.read_csv('../input/test.csv')
+
+    lgb_params = {
+        "objective": "binary",
+        "metric": "auc",
+        "boosting": 'gbdt',
+        "max_depth": -1,
+        "num_leaves": 13,
+        "learning_rate": 0.01,
+        "bagging_freq": 5,
+        "bagging_fraction": 0.4,
+        "feature_fraction": 0.05,
+        "min_data_in_leaf": 80,
+        # "min_sum_heassian_in_leaf": 10,
+        "tree_learner": "serial",
+        "boost_from_average": "false",
+        #"lambda_l1" : 5,
+        #"lambda_l2" : 5,
+        "bagging_seed": random_state,
+        "verbosity": 1,
+        "seed": random_state
+    }
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+
+    # 从训练集中划分出oof的结果集（本质上还是全量，但是用cv去调参）
+    oof = df_train[['ID_code', 'target']]
+    oof['predict'] = 0
+    predictions = df_test[['ID_code']]
+    val_aucs = []
+    feature_importance_df = pd.DataFrame()
+
+    features = [col for col in df_train.columns if col not in ['target', 'ID_code']]
+    X_test = df_test[features].values
+    for fold, (trn_idx, val_idx) in enumerate(skf.split(df_train, df_train['target'])):
+        X_train, y_train = df_train.iloc[trn_idx][features], df_train.iloc[trn_idx]['target']
+        X_valid, y_valid = df_train.iloc[val_idx][features], df_train.iloc[val_idx]['target']
+
+        X_t, y_t = augment(X_train.values, y_train.values)
+        X_t = pd.DataFrame(X_t)
+        X_t = X_t.add_prefix('var_')
+
+        trn_data = lgb.Dataset(X_t, label=y_t)
+        val_data = lgb.Dataset(X_valid, label=y_valid)
+        evals_result = {}
+        lgb_clf = lgb.train(lgb_params,
+                            trn_data,
+                            # 100000,
+                            3000,
+                            valid_sets=[trn_data, val_data],
+                            early_stopping_rounds=3000,
+                            verbose_eval=1000,
+                            evals_result=evals_result
+                            )
+        p_valid = lgb_clf.predict(X_valid)
+        yp = lgb_clf.predict(X_test)
+
+        fold_importance_df = pd.DataFrame()
+        fold_importance_df["feature"] = features
+        fold_importance_df["importance"] = lgb_clf.feature_importance()
+        fold_importance_df["fold"] = fold + 1
+        feature_importance_df = pd.concat([feature_importance_df, fold_importance_df], axis=0)
+        oof['predict'][val_idx] = p_valid
+        val_score = roc_auc_score(y_valid, p_valid)
+        val_aucs.append(val_score)
+
+        predictions['fold{}'.format(fold + 1)] = yp
+
+    mean_auc = np.mean(val_aucs)
+    std_auc = np.std(val_aucs)
+    all_auc = roc_auc_score(oof['target'], oof['predict'])
+    print("Mean auc: %.9f, std: %.9f. All auc: %.9f." % (mean_auc, std_auc, all_auc))
+
+
+    cols = (feature_importance_df[["feature", "importance"]]
+            .groupby("feature")
+            .mean()
+            .sort_values(by="importance", ascending=False)[:1000].index)
+    best_features = feature_importance_df.loc[feature_importance_df.feature.isin(cols)]
+
+    plt.figure(figsize=(14,26))
+    sns.barplot(x="importance", y="feature", data=best_features.sort_values(by="importance",ascending=False))
+    plt.title('LightGBM Features (averaged over folds)')
+    plt.tight_layout()
+    plt.savefig('lgbm_importances.png')
+
+
+    # submission
+    predictions['target'] = np.mean(predictions[[col for col in predictions.columns if col not in ['ID_code', 'target']]].values, axis=1)
+    predictions.to_csv('lgb_all_predictions.csv', index=None)
+    sub_df = pd.DataFrame({"ID_code":df_test["ID_code"].values})
+    sub_df["target"] = predictions['target']
+    sub_df.to_csv("lgb_submission.csv", index=False)
+    oof.to_csv('lgb_oof.csv', index=False)
+
+
+if __name__ == '__main__':
+    train()
